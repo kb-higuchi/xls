@@ -88,66 +88,86 @@ func (wb *WorkBook) parseBof(buf io.ReadSeeker, b *bof, pre *bof, offset_pre int
 		binary.Read(buf_item, binary.LittleEndian, &wb.Codepage)
 	case 0x3c: // CONTINUE
 		if pre.Id == 0xfc {
-			exhausted := false
-			hadContinuation := wb.continue_apsb > 0 || wb.continue_rich > 0
-
-			// In BIFF8 XLUnicodeString, rich text runs come before phonetic data.
-			// Handle continuation of rich text run data first.
-			if wb.continue_rich > 0 {
-				avail := int64(buf_item.Len())
-				bytesPerRun := int64(4)
-				if wb.Is5ver {
-					bytesPerRun = 2
-				}
-				skip := bytesPerRun * int64(wb.continue_rich)
-				if avail < skip {
-					wb.continue_rich -= uint16(avail / bytesPerRun)
-					buf_item.Seek(avail, io.SeekCurrent)
-					exhausted = true
-				} else {
-					buf_item.Seek(skip, io.SeekCurrent)
-					wb.continue_rich = 0
-				}
-			}
-
-			// Handle continuation of phonetic (furigana) data from the previous string
-			if wb.continue_apsb > 0 && !exhausted {
-				avail := int64(buf_item.Len())
-				skip := int64(wb.continue_apsb)
-				if avail < skip {
-					buf_item.Seek(avail, io.SeekCurrent)
-					wb.continue_apsb -= uint32(avail)
-					exhausted = true
-				} else {
-					buf_item.Seek(skip, io.SeekCurrent)
-					wb.continue_apsb = 0
-				}
-			}
-
-			if !exhausted {
-				// If we just finished all tail data of the previous string, advance the index
-				if hadContinuation && wb.continue_apsb == 0 && wb.continue_rich == 0 && wb.continue_utf16 == 0 {
-					offset_pre++
-				}
-				var size uint16
+			if wb.continue_utf16 >= 1 {
+				// Char-data continuation. get_string also handles rich text / phonetic
+				// continuation via continue_rich / continue_apsb (if set) because those
+				// bytes follow the char bytes in this same CONTINUE record.
+				size := wb.continue_utf16
+				wb.continue_utf16 = 0
+				var str string
 				var err error
-				if wb.continue_utf16 >= 1 {
-					size = wb.continue_utf16
-					wb.continue_utf16 = 0
-				} else {
-					err = binary.Read(buf_item, binary.LittleEndian, &size)
-				}
-				for err == nil && offset_pre < len(wb.sst) {
-					var str string
-					str, err = wb.get_string(buf_item, size)
-					wb.sst[offset_pre] = wb.sst[offset_pre] + str
-
-					if err == io.EOF {
-						break
-					}
-
+				str, err = wb.get_string(buf_item, size)
+				wb.sst[offset_pre] = wb.sst[offset_pre] + str
+				if err == nil {
+					// All data for this string complete; advance to next string.
 					offset_pre++
 					err = binary.Read(buf_item, binary.LittleEndian, &size)
+					for err == nil && offset_pre < len(wb.sst) {
+						str, err = wb.get_string(buf_item, size)
+						wb.sst[offset_pre] = wb.sst[offset_pre] + str
+						if err == io.EOF {
+							break
+						}
+						offset_pre++
+						err = binary.Read(buf_item, binary.LittleEndian, &size)
+					}
+				}
+				// If err == io.EOF: something (char/rich/phonetic) still pending; stay at
+				// offset_pre — the next CONTINUE will continue from here.
+			} else {
+				// Rich text / phonetic tail continuation, or a fresh run of new strings.
+				exhausted := false
+				hadContinuation := wb.continue_apsb > 0 || wb.continue_rich > 0
+
+				// In BIFF8 XLUnicodeString, rich text runs come before phonetic data.
+				if wb.continue_rich > 0 {
+					avail := int64(buf_item.Len())
+					bytesPerRun := int64(4)
+					if wb.Is5ver {
+						bytesPerRun = 2
+					}
+					skip := bytesPerRun * int64(wb.continue_rich)
+					if avail < skip {
+						wb.continue_rich -= uint16(avail / bytesPerRun)
+						buf_item.Seek(avail, io.SeekCurrent)
+						exhausted = true
+					} else {
+						buf_item.Seek(skip, io.SeekCurrent)
+						wb.continue_rich = 0
+					}
+				}
+
+				if wb.continue_apsb > 0 && !exhausted {
+					avail := int64(buf_item.Len())
+					skip := int64(wb.continue_apsb)
+					if avail < skip {
+						buf_item.Seek(avail, io.SeekCurrent)
+						wb.continue_apsb -= uint32(avail)
+						exhausted = true
+					} else {
+						buf_item.Seek(skip, io.SeekCurrent)
+						wb.continue_apsb = 0
+					}
+				}
+
+				if !exhausted {
+					// Advance past the string whose tail data was just consumed.
+					if hadContinuation {
+						offset_pre++
+					}
+					var size uint16
+					var err error
+					err = binary.Read(buf_item, binary.LittleEndian, &size)
+					for err == nil && offset_pre < len(wb.sst) {
+						var str string
+						str, err = wb.get_string(buf_item, size)
+						wb.sst[offset_pre] = wb.sst[offset_pre] + str
+						if err == io.EOF {
+							break
+						}
+						offset_pre++
+						err = binary.Read(buf_item, binary.LittleEndian, &size)
+					}
 				}
 			}
 		}
