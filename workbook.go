@@ -88,25 +88,62 @@ func (wb *WorkBook) parseBof(buf io.ReadSeeker, b *bof, pre *bof, offset_pre int
 		binary.Read(buf_item, binary.LittleEndian, &wb.Codepage)
 	case 0x3c: // CONTINUE
 		if pre.Id == 0xfc {
-			var size uint16
-			var err error
-			if wb.continue_utf16 >= 1 {
-				size = wb.continue_utf16
-				wb.continue_utf16 = 0
-			} else {
-				err = binary.Read(buf_item, binary.LittleEndian, &size)
-			}
-			for err == nil && offset_pre < len(wb.sst) {
-				var str string
-				str, err = wb.get_string(buf_item, size)
-				wb.sst[offset_pre] = wb.sst[offset_pre] + str
+			exhausted := false
+			hadContinuation := wb.continue_apsb > 0 || wb.continue_rich > 0
 
-				if err == io.EOF {
-					break
+			// Handle continuation of phonetic (furigana) data from the previous string
+			if wb.continue_apsb > 0 {
+				avail := int64(buf_item.Len())
+				skip := int64(wb.continue_apsb)
+				if avail < skip {
+					buf_item.Seek(avail, io.SeekCurrent)
+					wb.continue_apsb -= uint32(avail)
+					exhausted = true
+				} else {
+					buf_item.Seek(skip, io.SeekCurrent)
+					wb.continue_apsb = 0
 				}
+			}
 
-				offset_pre++
-				err = binary.Read(buf_item, binary.LittleEndian, &size)
+			// Handle continuation of rich text run data from the previous string
+			if wb.continue_rich > 0 && !exhausted {
+				avail := int64(buf_item.Len())
+				skip := int64(4) * int64(wb.continue_rich)
+				if avail < skip {
+					buf_item.Seek(avail, io.SeekCurrent)
+					wb.continue_rich -= uint16(avail / 4)
+					exhausted = true
+				} else {
+					buf_item.Seek(skip, io.SeekCurrent)
+					wb.continue_rich = 0
+				}
+			}
+
+			if !exhausted {
+				// If we just finished all tail data of the previous string, advance the index
+				if hadContinuation && wb.continue_apsb == 0 && wb.continue_rich == 0 && wb.continue_utf16 == 0 {
+					offset_pre++
+				}
+				var size uint16
+				var err error
+				if wb.continue_utf16 >= 1 {
+					size = wb.continue_utf16
+					wb.continue_utf16 = 0
+				} else {
+					err = binary.Read(buf_item, binary.LittleEndian, &size)
+				}
+				for err == nil && offset_pre < len(wb.sst) {
+					var str string
+					str, err = wb.get_string(buf_item, size)
+					wb.sst[offset_pre] = wb.sst[offset_pre] + str
+
+					if err == io.EOF {
+						break
+					}
+
+					offset_pre++
+					err = binary.Read(buf_item, binary.LittleEndian, &size)
+				}
 			}
 		}
 		offset = offset_pre
