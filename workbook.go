@@ -91,8 +91,27 @@ func (wb *WorkBook) parseBof(buf io.ReadSeeker, b *bof, pre *bof, offset_pre int
 			exhausted := false
 			hadContinuation := wb.continue_apsb > 0 || wb.continue_rich > 0
 
+			// In BIFF8 XLUnicodeString, rich text runs come before phonetic data.
+			// Handle continuation of rich text run data first.
+			if wb.continue_rich > 0 {
+				avail := int64(buf_item.Len())
+				bytesPerRun := int64(4)
+				if wb.Is5ver {
+					bytesPerRun = 2
+				}
+				skip := bytesPerRun * int64(wb.continue_rich)
+				if avail < skip {
+					wb.continue_rich -= uint16(avail / bytesPerRun)
+					buf_item.Seek(avail, io.SeekCurrent)
+					exhausted = true
+				} else {
+					buf_item.Seek(skip, io.SeekCurrent)
+					wb.continue_rich = 0
+				}
+			}
+
 			// Handle continuation of phonetic (furigana) data from the previous string
-			if wb.continue_apsb > 0 {
+			if wb.continue_apsb > 0 && !exhausted {
 				avail := int64(buf_item.Len())
 				skip := int64(wb.continue_apsb)
 				if avail < skip {
@@ -102,20 +121,6 @@ func (wb *WorkBook) parseBof(buf io.ReadSeeker, b *bof, pre *bof, offset_pre int
 				} else {
 					buf_item.Seek(skip, io.SeekCurrent)
 					wb.continue_apsb = 0
-				}
-			}
-
-			// Handle continuation of rich text run data from the previous string
-			if wb.continue_rich > 0 && !exhausted {
-				avail := int64(buf_item.Len())
-				skip := int64(4) * int64(wb.continue_rich)
-				if avail < skip {
-					buf_item.Seek(avail, io.SeekCurrent)
-					wb.continue_rich -= uint16(avail / 4)
-					exhausted = true
-				} else {
-					buf_item.Seek(skip, io.SeekCurrent)
-					wb.continue_rich = 0
 				}
 			}
 
@@ -268,27 +273,38 @@ func (w *WorkBook) get_string(buf io.ReadSeeker, size uint16) (res string, err e
 			res = string(runes)
 		}
 		if richtext_num > 0 {
-			var bts []byte
 			var seek_size int64
 			if w.Is5ver {
 				seek_size = int64(2 * richtext_num)
 			} else {
 				seek_size = int64(4 * richtext_num)
 			}
-			bts = make([]byte, seek_size)
-			err = binary.Read(buf, binary.LittleEndian, bts)
-			if err == io.EOF {
-				w.continue_rich = richtext_num
+			bts := make([]byte, seek_size)
+			n, readErr := io.ReadFull(buf, bts)
+			if readErr != nil {
+				bytesPerRun := int64(4)
+				if w.Is5ver {
+					bytesPerRun = 2
+				}
+				remainingBytes := seek_size - int64(n)
+				w.continue_rich = uint16((remainingBytes + bytesPerRun - 1) / bytesPerRun)
+				// All phonetic data is also pending when rich text was not fully consumed
+				if phonetic_size > 0 {
+					w.continue_apsb = phonetic_size
+				}
+				// Return io.EOF so the calling loop stops at the current index without incrementing
+				err = io.EOF
+				return
 			}
-
-			// err = binary.Read(buf, binary.LittleEndian, bts)
 		}
 		if phonetic_size > 0 {
-			var bts []byte
-			bts = make([]byte, phonetic_size)
-			err = binary.Read(buf, binary.LittleEndian, bts)
-			if err == io.EOF {
-				w.continue_apsb = phonetic_size
+			bts := make([]byte, phonetic_size)
+			n, readErr := io.ReadFull(buf, bts)
+			if readErr != nil {
+				// Store exact remaining bytes (handles both io.EOF and io.ErrUnexpectedEOF)
+				w.continue_apsb = phonetic_size - uint32(n)
+				// Return io.EOF so the calling loop stops at the current index without incrementing
+				err = io.EOF
 			}
 		}
 	}
